@@ -1,5 +1,5 @@
 // Trindco Tool Crib service worker: works offline, picks up new versions when online.
-const CACHE = 'trindco-tool-crib-v3';
+const CACHE = 'trindco-tool-crib-v4';
 const ASSETS = ['./', 'index.html', 'manifest.webmanifest', 'html5-qrcode.min.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png'];
 
