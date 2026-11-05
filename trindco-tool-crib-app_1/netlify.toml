@@ -1,0 +1,7 @@
+# Static app at the top level + one function for the shared live inventory.
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"

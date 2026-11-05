@@ -1,0 +1,9 @@
+{
+  "name": "trindco-tool-crib",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Trindco Tool Crib - CNC tooling inventory (static app + Netlify function for live shared data)",
+  "dependencies": {
+    "@netlify/blobs": "^11.1.7"
+  }
+}
