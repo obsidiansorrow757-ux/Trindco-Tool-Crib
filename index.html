@@ -120,6 +120,14 @@ tr.grp.open .caret{transform:rotate(90deg);background:var(--accent);color:#1a120
 tr.grp b{font-size:15px;vertical-align:middle}
 tr.grp .mute{vertical-align:middle}
 tr.sub td:first-child{padding-left:30px}
+/* sign-in screen */
+.login-ov{position:fixed;inset:0;z-index:95;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:16px;overflow:auto}
+.login-box{width:100%;max-width:380px;display:flex;flex-direction:column;gap:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px}
+.login-box img{width:100%;border-radius:10px}
+.login-box h2{margin:4px 0 0;font-size:18px}
+.login-box .btn{padding:11px;font-size:15px}
+.err{color:var(--out);min-height:1em;font-size:13px}
+.sync-pill.login{color:var(--low);background:#3d3317}
 /* live sync status */
 .sync-pill{font-size:12px;font-weight:600;border-radius:12px;padding:2px 10px;white-space:nowrap}
 .sync-pill:empty{display:none}
@@ -242,6 +250,15 @@ tr.sub td:first-child{padding-left:30px}
 </div>
 <div id="modalBack" class="modal-back hidden"><div class="modal" id="modal"></div></div>
 <div id="toast"></div>
+<div id="loginOv" class="login-ov hidden"><form class="login-box" onsubmit="event.preventDefault();doLogin()">
+  <img id="loginLogo" alt="Trindco Tool Crib">
+  <h2 id="loginTitle">Sign in</h2><div id="loginHint" class="mute"></div>
+  <div class="f hidden" id="loginNameRow"><label>Your name (shown in History)</label><input id="lgName" autocomplete="name"></div>
+  <div class="f"><label>Username</label><input id="lgUser" autocapitalize="none" autocorrect="off" autocomplete="username"></div>
+  <div class="f"><label>Password</label><input id="lgPass" type="password" autocomplete="current-password"></div>
+  <div id="loginErr" class="err"></div>
+  <button id="lgBtn" class="btn pri" type="submit">Continue</button>
+</form></div>
 <div id="scanOv" class="scan-ov hidden">
   <div class="scan-box">
     <div class="scan-hd"><b id="scanTitle">Scan serial #</b><button class="x" onclick="closeScanner()">×</button></div>
@@ -739,13 +756,16 @@ function delta(full){
   if(full || (S.settings._t || 0) > since){ const {user, ...x} = S.settings; d.settings = x; }
   return d;
 }
-async function api(method, body, qs = ''){
-  const r = await fetch(SYNC.url + qs, {method, cache:'no-store', headers:{'content-type':'application/json', 'x-shop-pin':lsGet('tcPin') || ''}, body: body ? JSON.stringify(body) : undefined});
-  if(r.status === 401){ const e = new Error('pin'); e.pin = true; throw e; }
-  if(r.status === 404){ const e = new Error('no server'); e.noServer = true; throw e; }
-  if(!r.ok) throw new Error('HTTP ' + r.status);
+async function api(method, body, qs = '', path = SYNC.url){
+  const tok = lsGet('tcToken');
+  // unique URL every time so no cache (including an older installed copy's offline cache) can serve stale data
+  const r = await fetch(path + qs + (qs ? '&' : '?') + '_=' + Date.now(), {method, cache:'no-store',
+    headers:{'content-type':'application/json', ...(tok ? {authorization:'Bearer ' + tok} : {})}, body: body ? JSON.stringify(body) : undefined});
   if(!(r.headers.get('content-type') || '').includes('json')){ const e = new Error('no server'); e.noServer = true; throw e; }
-  return r.json();
+  const data = await r.json();
+  if(r.status === 401 && data && data.error === 'login'){ const e = new Error('login'); e.auth = true; throw e; }
+  if(!r.ok){ const e = new Error((data && data.error) || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+  return data;
 }
 function applyRemote(srv){
   if(!srv || srv.same) return;
@@ -764,7 +784,7 @@ function setSync(status){
   SYNC.status = status; if(status === 'live') SYNC.lastOk = new Date();
   const el = $('#syncPill'); if(!el) return;
   el.className = 'sync-pill ' + status;
-  el.textContent = {live:'● Live', offline:'● Offline', local:'', pin:'● PIN needed'}[status] || '';
+  el.textContent = {live:'● Live', offline:'● Offline', local:'', login:'● Signed out'}[status] || '';
   el.title = status === 'live' ? 'Shared live inventory — last synced ' + SYNC.lastOk.toLocaleTimeString() : status === 'offline' ? 'No connection — changes are saved here and will sync when back online' : '';
   if(view === 'settings' && $('#modalBack').classList.contains('hidden')) safeRender();
 }
@@ -788,40 +808,100 @@ async function pull(){
 }
 function hasUnsent(){ const d = delta(false); return COLS.some(c => d[c].length) || Object.keys(d.deleted).length || d.log.length || d.settings; }
 function handleSyncError(e){
-  if(e.pin){ setSync('pin'); askPin(); return; }
-  if(e.noServer){ SYNC.on = false; setSync('local'); return; }
+  if(e.auth){ SYNC.on = false; clearInterval(SYNC.poll); setSync('login'); showLogin(); return; }
+  if(e.noServer){ SYNC.on = false; setSync('local'); hideLogin(); return; }
   setSync('offline');
 }
 async function initSync(){
   if(!/^https?:$/.test(location.protocol)) return setSync('local');
   SYNC.lastPush = +lsGet('tcLastPush') || 0;
+  let me;
+  try{ me = await api('GET', null, '', '/api/me'); }
+  catch(e){
+    if(e.auth || e.noServer) return handleSyncError(e);
+    if(ME){ hideLogin(); setSync('offline'); } else showLogin('offline');   // no signal: keep working as the last signed-in user
+    return;
+  }
+  if(me.needsSetup) return showLogin('setup');
+  setMe(me.user);
   try{
     const r = await api('GET');
     SYNC.on = true;
-    if(r){ applyRemote(r); }
+    if(r) applyRemote(r);
     if(!r || !lsGet('tcLastPush') || hasUnsent()) await push(); else setSync('live');
     clearInterval(SYNC.poll); SYNC.poll = setInterval(pull, 8000);
-    if(!lsGet('tcUser')) askName();
   }catch(e){ handleSyncError(e); }
 }
 window.addEventListener('online', () => { if(SYNC.on) push(); else initSync(); });
 document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') pull(); });
-function askPin(){
-  if(!$('#modalBack').classList.contains('hidden')) return;
-  modal('Shop PIN', `<div>Enter the shop PIN to open the shared inventory.</div>${field('PIN', `<input id="pinIn" type="password" inputmode="numeric" autocomplete="off">`)}`,
-    [{label:'Work offline'}, {label:'Connect', cls:'pri', fn:() => { lsSet('tcPin', val('pinIn').trim()); setTimeout(initSync, 50); }}]);
+
+/* ---------- users & roles ---------- */
+let ME = (() => { try{ return JSON.parse(lsGet('tcMe') || 'null'); }catch(e){ return null; } })();
+const isAdmin = () => !ME || ME.role === 'admin';            // a local-only copy (no server) has full access
+const adminOnly = html => isAdmin() ? html : '';
+function needAdmin(){ if(isAdmin()) return true; toast('Only an admin can do that'); return false; }
+function setMe(u){ ME = u; lsSet('tcMe', JSON.stringify(u)); S.settings.user = u.name; persist(); hideLogin(); render(); }
+function signOut(){
+  lsSet('tcToken', null); lsSet('tcMe', null); ME = null; SYNC.on = false; clearInterval(SYNC.poll);
+  setSync('login'); showLogin();
 }
-function askName(){
-  if(!$('#modalBack').classList.contains('hidden')) return;
-  modal('Who is using this device?', `<div class="mute">Your name is recorded in History on every allocate, return and scrap.</div>${field('Your name', `<input id="nmIn" value="${esc(S.settings.user || '')}">`)}`,
-    [{label:'Save', cls:'pri', fn:() => { const v = val('nmIn').trim(); if(!v){ toast('Enter a name'); return false; } setUser(v); }}]);
+function showLogin(mode){
+  const ov = $('#loginOv'), setup = mode === 'setup'; closeModal(); ov.classList.remove('hidden');
+  ov.dataset.mode = setup ? 'setup' : 'login';
+  $('#loginTitle').textContent = setup ? 'Create the admin account' : 'Sign in';
+  $('#loginNameRow').classList.toggle('hidden', !setup);
+  $('#lgPass').autocomplete = setup ? 'new-password' : 'current-password';
+  $('#loginHint').textContent = setup ? 'First-time setup. This account is the admin and can add everyone else in Settings → Users.'
+    : mode === 'offline' ? 'No connection — connect to the internet to sign in.' : '';
+  $('#loginErr').textContent = '';
+  if(!IS_TOUCH) setTimeout(() => (setup ? $('#lgName') : $('#lgUser')).focus(), 50);
 }
-function setUser(v){ lsSet('tcUser', v); S.settings.user = v; persist(); render(); toast('Hi ' + v); }
+function hideLogin(){ $('#loginOv').classList.add('hidden'); }
+async function doLogin(){
+  const setup = $('#loginOv').dataset.mode === 'setup', btn = $('#lgBtn');
+  const b = {username: val('lgUser').trim(), password: val('lgPass')}; if(setup) b.name = val('lgName').trim();
+  btn.disabled = true; $('#loginErr').textContent = '';
+  try{
+    const r = await api('POST', b, '', setup ? '/api/setup' : '/api/login');
+    lsSet('tcToken', r.token); $('#lgPass').value = ''; setMe(r.user); toast('Signed in as ' + r.user.name); initSync();
+  }catch(e){ $('#loginErr').textContent = e.noServer ? 'Can’t reach the server.' : (e.message || 'Sign-in failed'); }
+  btn.disabled = false;
+}
+let USERS = [];
+async function loadUsers(){
+  const box = $('#usersBox'); if(!box) return;
+  try{
+    USERS = (await api('GET', null, '', '/api/users')).users;
+    box.innerHTML = `<div class="tablewrap"><table><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th class="act"></th></tr>${USERS.map(u =>
+      `<tr><td>${esc(u.name)}${ME && u.id === ME.id ? ' <span class="mute">(you)</span>' : ''}</td><td class="code">${esc(u.username)}</td><td>${u.role === 'admin' ? 'Admin' : 'Operator'}</td>
+       <td>${u.active ? '<span class="badge b-ok">active</span>' : '<span class="badge b-out">blocked</span>'}</td><td class="act"><button class="btn sm" onclick="userModal('${u.id}')">Edit</button></td></tr>`).join('')}</table></div>`;
+    labelTables(box);
+  }catch(e){ box.innerHTML = `<div class="empty-state">${esc(e.message)}</div>`; }
+}
+function userModal(id){
+  const u = id ? USERS.find(x => x.id === id) : {name:'', username:'', role:'operator', active:true};
+  modal(id ? `Edit ${u.name}` : 'Add user', `<div class="fgrid">
+    ${field('Name (shown in History)', `<input id="usN" value="${esc(u.name)}">`)}${field('Username', `<input id="usU" value="${esc(u.username)}" autocapitalize="none" autocomplete="off">`)}
+    ${field(id ? 'New password (leave blank to keep)' : 'Password (4+ characters)', `<input id="usP" type="password" autocomplete="new-password">`)}
+    ${field('Role', `<select id="usR"><option value="operator" ${u.role !== 'admin' ? 'selected' : ''}>Operator</option><option value="admin" ${u.role === 'admin' ? 'selected' : ''}>Admin</option></select>`)}
+    ${id ? `<label class="chk full"><input type="checkbox" id="usA" ${u.active ? 'checked' : ''}> Active — untick to block this person from signing in</label>` : ''}</div>
+    <div class="note"><b>Operator:</b> allocate, return, move, receive, scrap and add tools.<br><b>Admin:</b> everything, including users, cabinets / machines, products, re-order points and reset.</div>`,
+    [...(id && ME && id !== ME.id ? [{label:'Delete', cls:'danger left', fn:() => { if(!confirm('Delete user ' + u.name + '?')) return false;
+        api('DELETE', null, '?id=' + encodeURIComponent(id), '/api/users').then(() => { toast('User deleted'); loadUsers(); }).catch(e => toast(e.message)); }}] : []),
+     {label:'Cancel'}, {label:'Save', cls:'pri', fn:() => {
+        const b = {id: id || undefined, name: val('usN').trim(), username: val('usU').trim(), password: val('usP'), role: val('usR'), active: id ? document.getElementById('usA').checked : true};
+        api('POST', b, '', '/api/users').then(r => {
+          closeModal(); toast(id ? 'User updated' : 'User added');
+          if(ME && id === ME.id){ if(b.password) toast('Password changed — sign in again'); else setMe({...ME, ...r.user}); }
+          loadUsers();
+        }).catch(e => toast(e.message));
+        return false; }}]);
+}
 function syncCard(){
   const st = SYNC.status;
   const line = st === 'live' ? `<div class="note">● <b>Live</b> — this device shares one inventory with every phone / PC using this link. Last synced ${SYNC.lastOk ? SYNC.lastOk.toLocaleTimeString() : '—'}.</div>`
     : st === 'offline' ? `<div class="note warn">● <b>Offline</b> — changes are saved on this device and will sync automatically when the connection is back.</div>`
-    : st === 'pin' ? `<div class="note warn">A shop PIN is required. <button class="btn sm" onclick="askPin()">Enter PIN</button></div>`
+    : st === 'login' ? `<div class="note warn">Signed out. <button class="btn sm" onclick="showLogin()">Sign in</button></div>`
     : `<div class="note">This copy is <b>local only</b> (opened as a file, or the site has no sync function). Open it from your Netlify link to share live data.</div>`;
   return `<div class="card"><div class="hd"><h3>Live sync</h3>${SYNC.on ? `<button class="btn sm" onclick="push();pull()">Sync now</button>` : ''}</div><div class="bd">${line}</div></div>`;
 }
@@ -1023,7 +1103,7 @@ function renderMachines(){
       <button class="btn sm" onclick="moveModal('${u.id}')">Move</button> <button class="btn sm danger" onclick="scrapModal('${u.id}')">Scrap</button></td></tr>`; }).join('');
     return `<div class="card"><div class="hd"><h3 class="mname">${CNC_ICON}${esc(m.name)}</h3><span class="mute">${all.length} tool(s)</span>
       <button class="btn sm pri" onclick="allocateModal({locId:'${m.id}'})">+ Allocate</button>
-      <button class="btn sm" onclick="locModal('${m.id}')">Edit</button></div>
+      ${adminOnly(`<button class="btn sm" onclick="locModal('${m.id}')">Edit</button>`)}</div>
       <div class="bd flush">${rows ? `<div class="tablewrap"><table><tr><th>Serial #</th><th>Product / Part #</th><th>Cond</th><th class="act"></th></tr>${rows}</table></div>` : '<div class="empty-state">No tools allocated</div>'}</div></div>`;
   }).join('') + `</div>`;
 }
@@ -1069,8 +1149,8 @@ function renderCabinet(){
       const rows = groupedRows('cab:' + c.id, us, u => familyOf(u.productId), 7, row, list => `${list.length} tools · ${[...new Set(list.map(u => u.slot))].sort((a, b) => bins.indexOf(a) - bins.indexOf(b)).join(', ')}`);
       shownGroups.cab = prevKeys.concat(shownGroups['cab:' + c.id]);
       return `<div class="card"><div class="hd"><h3 class="mname">${CAB_ICON}${esc(c.name)}</h3><span class="mute">${all.length} tool(s) · ${bins.length} bins</span>
-        <button class="btn sm noprint" onclick="addBinModal('${c.id}')">+ Bin</button>
-        <button class="btn sm noprint" onclick="locModal('${c.id}')">Edit</button></div>
+        ${adminOnly(`<button class="btn sm noprint" onclick="addBinModal('${c.id}')">+ Bin</button>
+        <button class="btn sm noprint" onclick="locModal('${c.id}')">Edit</button>`)}</div>
         <div class="bd flush">${rows ? `<div class="tablewrap"><table><tr><th>Bin</th><th>Serial #</th><th>Product</th><th>Part #</th><th>Batch #</th><th>Cond</th><th class="act"></th></tr>${rows}</table></div>` : '<div class="empty-state">Empty</div>'}</div></div>`;
     }).join('');
 }
@@ -1102,11 +1182,11 @@ function renderProducts(){
   const row = (p, sub) => `<tr class="click ${sub ? 'sub' : ''}" onclick="productDetail('${p.id}')"><td>${esc(p.name)}</td><td class="code">${esc(p.partNo)}</td><td>${esc(p.type)}</td>
     <td>${esc(p.vendor)}</td><td class="num">${money(p.cost)}</td><td class="num">${unitsOf(p.id, 'cabinet').length}</td><td class="num">${unitsOf(p.id, 'machine').length}</td>
     <td class="num">${onOrder(p.id) || ''}</td><td class="num">${p.reorderPoint}</td><td>${badge(p)}</td>
-    <td class="act" onclick="event.stopPropagation()"><button class="btn sm" onclick="unitModal(null,'${p.id}')">+ Serial</button> <button class="btn sm" onclick="productModal('${p.id}')">Edit</button></td></tr>`;
+    <td class="act" onclick="event.stopPropagation()"><button class="btn sm" onclick="unitModal(null,'${p.id}')">+ Serial</button> ${adminOnly(`<button class="btn sm" onclick="productModal('${p.id}')">Edit</button>`)}</td></tr>`;
   const rows = groupedRows('products', list, p => familyName(p.name), 11, row, ps => {
     const cab = ps.reduce((a, p) => a + unitsOf(p.id, 'cabinet').length, 0), mac = ps.reduce((a, p) => a + unitsOf(p.id, 'machine').length, 0), low = ps.filter(needsReorder).length;
     return `${ps.length} positions / part #s · ${cab} in cabinet · ${mac} on machines${low ? ` · <span class="badge b-low">${low} need re-order</span>` : ''}`; });
-  return `<div class="row noprint" style="margin-bottom:14px"><button class="btn pri" onclick="productModal()">+ New product</button>
+  return `<div class="row noprint" style="margin-bottom:14px">${adminOnly(`<button class="btn pri" onclick="productModal()">+ New product</button>`)}
       <select class="btn" onchange="typeFilter=this.value;render()"><option value="">All types</option>${TYPES.map(x => `<option ${x === typeFilter ? 'selected' : ''}>${x}</option>`).join('')}</select>
       ${groupButtons('products')}<span class="mute">${list.length} product(s)</span></div>
     <div class="card"><div class="bd flush">${rows ? `<div class="tablewrap"><table><tr><th>Product</th><th>Part #</th><th>Type</th><th>Vendor</th><th class="num">Cost</th>
@@ -1121,7 +1201,7 @@ function renderReorder(){
   const open = S.orders.filter(o => o.status === 'open').sort((a, b) => a.date < b.date ? 1 : -1);
   const openRows = open.map(o => `<tr><td class="code">${esc(o.po)}</td><td>${esc(o.vendor || '')}</td><td>${esc(plabel(prod(o.productId)))}</td>
     <td class="num">${o.qty}</td><td class="num">${o.recv || 0}</td><td>${fdt(o.date)}</td>
-    <td class="act"><button class="btn sm pri" onclick="receiveModal('${o.productId}','${o.id}')">Receive</button> <button class="btn sm danger" onclick="cancelOrder('${o.id}')">Cancel</button></td></tr>`).join('');
+    <td class="act"><button class="btn sm pri" onclick="receiveModal('${o.productId}','${o.id}')">Receive</button> ${adminOnly(`<button class="btn sm danger" onclick="cancelOrder('${o.id}')">Cancel</button>`)}</td></tr>`).join('');
   const rpRows = S.products.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric:true})).map(p => `<tr>
     <td>${esc(p.name)}</td><td class="code">${esc(p.partNo)}</td><td class="num">${unitsOf(p.id, 'cabinet').length}</td><td class="num">${unitsOf(p.id, 'machine').length}</td>
     <td class="num"><input type="number" min="0" value="${p.reorderPoint}" onchange="setRP('${p.id}','reorderPoint',this.value)"></td>
@@ -1130,19 +1210,19 @@ function renderReorder(){
     <td id="st_${p.id}">${badge(p)}</td></tr>`).join('');
   return `<div class="row noprint" style="margin-bottom:14px">
       <div class="f" style="min-width:280px"><label>Re-order point compares against</label>
-      <select onchange="S.settings.reorderBasis=this.value;commit('Re-order basis updated')">
+      <select ${isAdmin() ? '' : 'disabled'} onchange="S.settings.reorderBasis=this.value;commit('Re-order basis updated')">
         <option value="cabinet" ${S.settings.reorderBasis === 'cabinet' ? 'selected' : ''}>Cabinet stock only (spares)</option>
         <option value="all" ${S.settings.reorderBasis === 'all' ? 'selected' : ''}>Cabinet + tools on machines</option></select></div>
-      <div class="spacer"></div><button class="btn" onclick="manualOrderModal()">+ Manual order</button></div>
+      <div class="spacer"></div>${adminOnly(`<button class="btn" onclick="manualOrderModal()">+ Manual order</button>`)}</div>
     <div class="card"><div class="hd"><h3>Suggested orders (${sug.length})</h3><span class="mute" id="roTot"></span>
       <button class="btn sm noprint" onclick="copyOrderList()">Copy list</button><button class="btn sm noprint" onclick="window.print()">Print</button>
-      <button class="btn sm pri noprint" onclick="createOrders()">Create orders for selected</button></div>
+      ${adminOnly(`<button class="btn sm pri noprint" onclick="createOrders()">Create orders for selected</button>`)}</div>
       <div class="bd flush">${sugRows ? `<div class="tablewrap"><table><tr><th></th><th>Product</th><th>Part #</th><th>Vendor</th><th class="num">Avail</th><th class="num">On order</th><th class="num">RP</th><th class="num">Order qty</th><th class="num">Unit</th><th class="num">Ext</th></tr>${sugRows}</table></div>`
         : '<div class="empty-state">Nothing at or below its re-order point.</div>'}</div></div>
     <div class="card"><div class="hd"><h3>Open orders (${open.length})</h3></div>
       <div class="bd flush">${openRows ? `<div class="tablewrap"><table><tr><th>PO</th><th>Vendor</th><th>Product</th><th class="num">Qty</th><th class="num">Rec'd</th><th>Ordered</th><th class="act"></th></tr>${openRows}</table></div>` : '<div class="empty-state">No open orders.</div>'}</div></div>
-    <div class="card noprint"><div class="hd"><h3>Re-order point setup (per part #)</h3><span class="mute">Saves automatically. Suggests an order when available + on order ≤ RP.</span></div>
-      <div class="bd flush"><div class="tablewrap"><table><tr><th>Product</th><th>Part #</th><th class="num">Cabinet</th><th class="num">Machines</th><th class="num">Re-order point</th><th class="num">Re-order qty</th><th class="num">Unit cost</th><th>Status</th></tr>${rpRows}</table></div></div></div>`;
+    ${adminOnly(`<div class="card noprint"><div class="hd"><h3>Re-order point setup (per part #)</h3><span class="mute">Saves automatically. Suggests an order when available + on order ≤ RP.</span></div>
+      <div class="bd flush"><div class="tablewrap"><table><tr><th>Product</th><th>Part #</th><th class="num">Cabinet</th><th class="num">Machines</th><th class="num">Re-order point</th><th class="num">Re-order qty</th><th class="num">Unit cost</th><th>Status</th></tr>${rpRows}</table></div></div></div>`)}`;
 }
 function roTotal(){
   let tot = 0;
@@ -1151,6 +1231,7 @@ function roTotal(){
   const el = $('#roTot'); if(el) el.textContent = 'Selected total: ' + money(tot);
 }
 function setRP(id, f, v){
+  if(!needAdmin()) return render();
   const p = prod(id); p[f] = f === 'cost' ? num(v) : Math.max(0, Math.round(num(v))); save();
   const st = document.getElementById('st_' + id); if(st) st.innerHTML = badge(p);
   const n = S.products.filter(needsReorder).length, pill = $('#roPill'); pill.textContent = n; pill.classList.toggle('hidden', !n);
@@ -1161,6 +1242,7 @@ function nextPO(){
   return `PO-${ymd}-${new Set(S.orders.filter(o => (o.po || '').startsWith('PO-' + ymd)).map(o => o.po)).size + 1}`;
 }
 function createOrders(){
+  if(!needAdmin()) return;
   const sel = [...document.querySelectorAll('.roChk')].filter(c => c.checked).map(c => prod(c.dataset.id));
   if(!sel.length) return toast('Nothing selected');
   const byV = {}; sel.forEach(p => (byV[p.vendor || '(no vendor)'] ||= []).push(p));
@@ -1179,11 +1261,13 @@ function copyOrderList(){
   if(navigator.clipboard) navigator.clipboard.writeText(txt).then(() => toast('Order list copied'), show); else show();
 }
 function cancelOrder(id){
+  if(!needAdmin()) return;
   const o = S.orders.find(x => x.id === id);
   modal('Cancel order', `<div>Cancel ${esc(o.po)} — ${o.qty - (o.recv || 0)} remaining of ${esc(plabel(prod(o.productId)))}?</div>`,
     [{label:'Keep'}, {label:'Cancel order', cls:'danger', fn:() => { o.status = 'cancelled'; logIt('Order cancelled', null, '', o.vendor, o.po, o.productId); commit('Order cancelled'); }}]);
 }
 function manualOrderModal(){
+  if(!needAdmin()) return;
   if(!S.products.length) return toast('Add a product first');
   const p0 = S.products[0];
   modal('Manual order', `<div class="fgrid">
@@ -1213,19 +1297,22 @@ function renderHistory(){
 }
 
 function renderSettings(){
+  if(ME && isAdmin()) setTimeout(loadUsers, 0);
   const lrows = S.locations.map(l => `<tr><td>${esc(l.name)}</td><td>${l.kind}</td><td class="mute">${l.kind === 'machine' ? esc(l.model || '') : esc(slotsFor(l).join(', '))}</td>
     <td class="num">${S.units.filter(u => u.locId === l.id).length}</td><td class="act"><button class="btn sm" onclick="locModal('${l.id}')">Edit</button></td></tr>`).join('');
   return `<div class="grid2">
     <div class="card"><div class="hd"><h3>General</h3></div><div class="bd">
-      ${field('Your name on this device (recorded in History)', `<input value="${esc(S.settings.user)}" onchange="setUser(this.value.trim())">`)}</div></div>
+      ${ME ? `<div class="row"><div>Signed in as <b>${esc(ME.name)}</b> <span class="mute">(${esc(ME.username)} · ${ME.role === 'admin' ? 'Admin' : 'Operator'})</span></div><div class="spacer"></div><button class="btn" onclick="signOut()">Sign out</button></div>`
+        : field('Your name on this device (recorded in History)', `<input value="${esc(S.settings.user)}" onchange="setUser(this.value.trim())">`)}</div></div>
     <div class="card"><div class="hd"><h3>Data</h3></div><div class="bd row">
-      <button class="btn" onclick="exportJSON()">Backup (JSON)</button><button class="btn" onclick="document.getElementById('imp').click()">Restore (JSON)</button>
+      <button class="btn" onclick="exportJSON()">Backup (JSON)</button>${adminOnly(`<button class="btn" onclick="document.getElementById('imp').click()">Restore (JSON)</button>`)}
       <input type="file" id="imp" accept=".json" class="hidden" onchange="importJSON(this)">
-      <button class="btn" onclick="exportCSV()">Inventory CSV</button><button class="btn" onclick="importModal()">Paste import</button><button class="btn danger" onclick="resetModal()">Reset…</button></div>
+      <button class="btn" onclick="exportCSV()">Inventory CSV</button><button class="btn" onclick="importModal()">Paste import</button>${adminOnly(`<button class="btn danger" onclick="resetModal()">Reset…</button>`)}</div>
       <div class="bd"><div class="note">Data is saved on this device. Back up to JSON before clearing browser data or moving to another device.</div></div></div></div>
+    ${ME && isAdmin() ? `<div class="card"><div class="hd"><h3>Users</h3><button class="btn sm pri" onclick="userModal()">+ Add user</button></div><div class="bd flush" id="usersBox"><div class="empty-state">Loading…</div></div></div>` : ''}
     ${syncCard()}${installCard()}
-    <div class="card"><div class="hd"><h3>Locations</h3><button class="btn sm" onclick="locModal(null,'cabinet')">+ Cabinet</button><button class="btn sm" onclick="locModal(null,'machine')">+ Machine</button></div>
-      <div class="bd flush"><div class="tablewrap"><table><tr><th>Name</th><th>Type</th><th>Bins / model</th><th class="num">Tools</th><th class="act"></th></tr>${lrows}</table></div></div></div>`;
+    ${adminOnly(`<div class="card"><div class="hd"><h3>Locations</h3><button class="btn sm" onclick="locModal(null,'cabinet')">+ Cabinet</button><button class="btn sm" onclick="locModal(null,'machine')">+ Machine</button></div>
+      <div class="bd flush"><div class="tablewrap"><table><tr><th>Name</th><th>Type</th><th>Bins / model</th><th class="num">Tools</th><th class="act"></th></tr>${lrows}</table></div></div></div>`)}`;
 }
 
 /* =========================================================
@@ -1238,11 +1325,12 @@ function productDetail(pid){
     <div class="row"><span>Cabinet: <b>${unitsOf(pid, 'cabinet').length}</b></span><span>Machines: <b>${unitsOf(pid, 'machine').length}</b></span>
       <span>On order: <b>${onOrder(pid)}</b></span><span>RP: <b>${p.reorderPoint}</b> / RQ: <b>${p.reorderQty}</b></span></div>
     <div class="tablewrap">${rows ? `<table><tr><th>Serial #</th><th>Batch #</th><th>Location</th><th>Cond</th><th></th></tr>${rows}</table>` : '<div class="empty-state">No serials on hand.</div>'}</div>`,
-    [{label:'Edit product', cls:'left', fn:() => { productModal(pid); return false; }}, {label:'+ Serial', fn:() => { unitModal(null, pid); return false; }},
+    [...(isAdmin() ? [{label:'Edit product', cls:'left', fn:() => { productModal(pid); return false; }}] : []), {label:'+ Serial', fn:() => { unitModal(null, pid); return false; }},
      {label:'Receive', fn:() => { receiveModal(pid); return false; }}, {label:'Close'}], true);
 }
 
 function productModal(pid){
+  if(!needAdmin()) return;
   const p = pid ? prod(pid) : {name:'', partNo:'', type:TYPES[0], vendor:'', cost:0, reorderPoint:0, reorderQty:1};
   modal(pid ? 'Edit product' : 'New product', `<div class="fgrid">
     ${field('Product name', `<input id="pN" value="${esc(p.name)}">`)}${field('Vendor part #', `<input id="pP" value="${esc(p.partNo)}">`)}
@@ -1278,23 +1366,28 @@ function unitModal(uid_, presetPid){
     ${field('Cost', `<input id="uC" type="number" step="0.01" min="0" value="${p.cost}">`)}${field('Re-order point', `<input id="uR" type="number" min="0" value="${p.reorderPoint}">`)}
     ${u ? '' : field('Location', `<select id="uL">${anyLocOptions(cur)}</select>`) + field('Condition', `<select id="uCo">${CONDS.map(c => `<option value="${c}">${c === 'new' ? 'new' : 'EDM'}</option>`).join('')}</select>`)}</div>
     <div class="note" id="uHint">Type, vendor, cost and re-order point are shared by every serial with the same part #.</div>`,
-    [...(u ? [{label:'Delete', cls:'danger left', fn:() => { if(!confirm(`Delete serial ${u.serial}? (Use Scrap if the tool was worn out or broken.)`)) return false;
+    [...(u && isAdmin() ? [{label:'Delete', cls:'danger left', fn:() => { if(!confirm(`Delete serial ${u.serial}? (Use Scrap if the tool was worn out or broken.)`)) return false;
         logIt('Deleted', u, where(u), '', 'Entry removed'); S.units = S.units.filter(x => x.id !== u.id); commit('Tool deleted'); }}] : []),
      {label:'Cancel'}, ...(u ? [] : [{label:'Save & add another', fn:() => saveUnit(null, true)}]), {label:'Save', cls:'pri', fn:() => saveUnit(u)}]);
+  // operators can add serials to an existing product but not change the product itself
+  if(!isAdmin() && (u || presetPid)) ['uN','uP','uT','uV','uC','uR'].forEach(id => document.getElementById(id).disabled = true);
 }
 function fillFromPart(v){
   const p = findProduct(v, ''); const h = document.getElementById('uHint');
+  if(!isAdmin()) ['uN','uT','uV','uC','uR'].forEach(id => document.getElementById(id).disabled = false);
   if(!p){ if(h) h.textContent = v.trim() ? 'New part # — a new product will be created.' : 'Type, vendor, cost and re-order point are shared by every serial with the same part #.'; return; }
   document.getElementById('uN').value = p.name; document.getElementById('uT').value = p.type; document.getElementById('uV').value = p.vendor;
   document.getElementById('uC').value = p.cost; document.getElementById('uR').value = p.reorderPoint;
-  if(h) h.textContent = `Existing product: ${plabel(p)} (${unitsOf(p.id).length} serial(s) on hand).`;
+  if(h) h.textContent = `Existing product: ${plabel(p)} (${unitsOf(p.id).length} serial(s) on hand).` + (isAdmin() ? '' : ' Only an admin can change its details.');
+  if(!isAdmin()) ['uN','uT','uV','uC','uR'].forEach(id => document.getElementById(id).disabled = true);
 }
 function saveUnit(u, again){
   const serial = val('uS').trim(), name = val('uN').trim(), partNo = val('uP').trim();
   if(!serial){ toast('Serial # is required'); return false; }
   if(!name){ toast('Product name is required'); return false; }
   const dup = unitBySerial(serial); if(dup && dup !== u){ toast(`Serial ${serial} already exists (${where(dup)})`); return false; }
-  const p = upsertProduct({name, partNo, type:val('uT'), vendor:val('uV').trim(), cost:num(val('uC')), reorderPoint:Math.max(0, Math.round(num(val('uR'))))});
+  const existing = findProduct(partNo, name);
+  const p = !isAdmin() && existing ? existing : upsertProduct({name, partNo, type:val('uT'), vendor:val('uV').trim(), cost:num(val('uC')), reorderPoint:Math.max(0, Math.round(num(val('uR'))))});
   if(u){ u.serial = serial; u.batch = val('uB').trim(); u.productId = p.id; logIt('Edited', u, '', '', ''); commit('Tool updated'); return; }
   const {locId, slot} = splitLoc(val('uL'));
   const n = {id:uid(), serial, productId:p.id, batch:val('uB').trim(), locId, slot, cond:val('uCo'), added:nowIso()};
@@ -1424,6 +1517,7 @@ function importPreview(){
 }
 
 function addBinModal(locId){
+  if(!needAdmin()) return;
   const c = loc(locId);
   modal(`Add bin to ${c.name}`, `${field('Bin / drawer name', `<input id="nbN" placeholder="e.g. Drawer 5">`)}<div class="mute">Current: ${esc(slotsFor(c).join(', '))}</div>`,
     [{label:'Cancel'}, {label:'Add bin', cls:'pri', fn:() => {
@@ -1432,6 +1526,7 @@ function addBinModal(locId){
       c.bins = slotsFor(c).concat(n); commit(`Added ${n}`); }}]);
 }
 function locModal(id, kind){
+  if(!needAdmin()) return;
   const l = id ? loc(id) : {name:'', kind, bins:['Drawer 1','Drawer 2','Drawer 3'], model:''}, k = l.kind;
   modal(id ? `Edit ${l.name}` : `New ${k}`, `<div class="fgrid">${field('Name', `<input id="lN" value="${esc(l.name)}">`, 'full')}
     ${k === 'machine' ? field('Model (optional)', `<input id="lM" value="${esc(l.model || '')}">`, 'full') : field('Bins / drawers (one per line)', `<textarea id="lB" rows="6">${esc((l.bins || []).join('\n'))}</textarea>`, 'full')}</div>`,
@@ -1503,7 +1598,7 @@ const IS_APP = matchMedia('(display-mode: standalone)').matches || navigator.sta
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; if(view === 'settings') render(); });
 window.addEventListener('appinstalled', () => { installPrompt = null; toast('Trindco Tool Crib installed'); if(view === 'settings') render(); });
 function installApp(){ if(!installPrompt) return; installPrompt.prompt(); installPrompt.userChoice.finally(() => { installPrompt = null; render(); }); }
-if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(() => {});
+if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js', {updateViaCache:'none'}).then(r => r.update()).catch(() => {});
 if(navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 function installCard(){
   const how = IS_APP ? '<div class="note">✓ Running as the installed app.</div>'
@@ -1520,6 +1615,7 @@ const csvCell = v => { v = String(v ?? ''); return /[",\n]/.test(v) ? '"' + v.re
 const toCSV = rows => rows.map(r => r.map(csvCell).join(',')).join('\n');
 function exportJSON(){ download(`trindco-tool-crib-backup-${dateStamp()}.json`, JSON.stringify(S, null, 2), 'application/json'); }
 function importJSON(input){
+  if(!needAdmin()){ input.value = ''; return; }
   const f = input.files[0]; if(!f) return; const r = new FileReader();
   r.onload = () => { try{ const d = JSON.parse(r.result);
       if(!Array.isArray(d.products) || !Array.isArray(d.units) || !Array.isArray(d.locations)) throw 0;
@@ -1535,6 +1631,7 @@ function exportLogCSV(){
   download(`tool-history-${dateStamp()}.csv`, toCSV([['Time','Action','Serial #','Product','From','To','User','Note'], ...S.log.map(l => [l.ts, l.action, l.serial, l.pname, l.from, l.to, l.user, l.note])]), 'text/csv');
 }
 function resetModal(){
+  if(!needAdmin()) return;
   modal('Reset data', `<div class="note warn">Replaces all tools, products, orders and history${SYNC.on ? ' <b>for everyone using the live inventory</b>' : ' in this browser'}. Cabinets and machines are kept. Back up first if you need it.</div>`,
     [{label:'Cancel'}, {label:'Reload starter list', fn:() => { S = starterState(S.locations, S.settings.user); commit('Starter list loaded'); }},
      {label:'Start empty', cls:'danger', fn:() => { S = emptyState(S.locations, S.settings.user); commit('Inventory cleared'); }}]);
@@ -1547,7 +1644,10 @@ $('#search').addEventListener('keydown', e => { if(e.key === 'Enter'){ const u =
 $('#search').addEventListener('input', e => { query = e.target.value.trim(); if(!['tools','cabinet','machines','products'].includes(view)) view = 'tools'; render(); });
 $('#modalBack').addEventListener('mousedown', e => { if(e.target.id === 'modalBack') closeModal(); });
 document.addEventListener('keydown', e => { if(e.key === 'Escape'){ if(!$('#scanOv').classList.contains('hidden')) closeScanner(); else closeModal(); } });
-S = load(); if(lsGet('tcUser')) S.settings.user = lsGet('tcUser'); snapshot(); save(); render(); initSync();
+S = load(); if(ME) S.settings.user = ME.name; else if(lsGet('tcUser')) S.settings.user = lsGet('tcUser');
+$('#loginLogo').src = $('#splash img').src;
+if(/^https?:$/.test(location.protocol) && !lsGet('tcToken')) showLogin();   // live site: sign in first
+snapshot(); save(); render(); initSync();
 </script>
 </body>
 </html>
