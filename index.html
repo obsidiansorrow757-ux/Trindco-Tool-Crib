@@ -120,6 +120,11 @@ tr.grp.open .caret{transform:rotate(90deg);background:var(--accent);color:#1a120
 tr.grp b{font-size:15px;vertical-align:middle}
 tr.grp .mute{vertical-align:middle}
 tr.sub td:first-child{padding-left:30px}
+/* live sync status */
+.sync-pill{font-size:12px;font-weight:600;border-radius:12px;padding:2px 10px;white-space:nowrap}
+.sync-pill:empty{display:none}
+.sync-pill.live{color:var(--ok);background:#1d3b2e}
+.sync-pill.offline,.sync-pill.pin{color:var(--low);background:#3d3317}
 #toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);border:1px solid var(--accent);padding:10px 14px;border-radius:8px;opacity:0;transform:translateY(10px);transition:.2s;z-index:60;pointer-events:none}
 #toast.show{opacity:1;transform:none}
 @media (max-width:900px){
@@ -226,7 +231,7 @@ tr.sub td:first-child{padding-left:30px}
   </aside>
   <main>
     <header class="top">
-      <h1 id="viewTitle"></h1>
+      <h1 id="viewTitle"></h1><span id="syncPill" class="sync-pill"></span>
       <input id="search" placeholder="Search serial #, product, part #, batch…">
       <button class="btn scan-top" onclick="scanFind()" title="Scan a serial #"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 7V4h3M21 7V4h-3M3 17v3h3M21 17v3h-3M7 8v8M10 8v8M13 8v8M16.5 8v8"/></svg><span class="lbl">Scan</span></button>
       <button class="btn hide-sm" onclick="unitModal()">+ Add tool</button>
@@ -690,7 +695,136 @@ function upgrade(d){
   f.settings.freshVer = FRESH_VER;
   return f;
 }
-function save(){ memCopy = S; try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){} }
+function persist(){ memCopy = S; try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }catch(e){} }
+function save(){ stamp(); persist(); if(SYNC.on) schedulePush(); }
+
+/* =========================================================
+   LIVE SYNC — shares one inventory between every phone / PC through the
+   Netlify function at /api/inventory. Each record carries _t (last edit time);
+   newest edit wins, deletions are kept as tombstones, history is merged.
+   Without the function (e.g. opened as a file) the app simply stays local.
+   ========================================================= */
+const SYNC = {url:'/api/inventory', on:false, status:'local', rev:0, busy:false, pending:false, timer:null, lastOk:null, lastPush:0};
+const COLS = ['locations','products','units','orders'];
+const lsGet = k => { try{ return localStorage.getItem(k); }catch(e){ return null; } };
+const lsSet = (k, v) => { try{ v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); }catch(e){} };
+const stripT = r => { const {_t, ...x} = r; return JSON.stringify(x); };
+const sharedSettings = () => { const {user, _t, ...x} = S.settings || {}; return JSON.stringify(x); };
+let synced = new Map();
+function snapshot(){ synced = new Map(); COLS.forEach(c => (S[c] || []).forEach(r => synced.set(r.id, stripT(r)))); synced.set('__settings', sharedSettings()); }
+function stamp(){
+  const now = Date.now(), seen = new Set(); S.deleted ||= {};
+  COLS.forEach(c => (S[c] || []).forEach(r => { seen.add(r.id); const j = stripT(r); if(synced.get(r.id) !== j){ r._t = now; synced.set(r.id, j); } }));
+  for(const id of [...synced.keys()]) if(id !== '__settings' && !seen.has(id)){ S.deleted[id] = now; synced.delete(id); }
+  const sj = sharedSettings(); if(synced.get('__settings') !== sj){ S.settings._t = now; synced.set('__settings', sj); }
+}
+function mergeState(a, b){
+  if(!a) return b; if(!b) return a;
+  const out = {...a}, del = {...(a.deleted || {})};
+  for(const [k, v] of Object.entries(b.deleted || {})) if(!del[k] || v > del[k]) del[k] = v;
+  COLS.forEach(c => { const m = new Map();
+    [...(a[c] || []), ...(b[c] || [])].forEach(r => { const e = m.get(r.id); if(!e || (r._t || 0) >= (e._t || 0)) m.set(r.id, r); });
+    out[c] = [...m.values()].filter(r => !(del[r.id] && del[r.id] >= (r._t || 0))); });
+  const lm = new Map(); [...(a.log || []), ...(b.log || [])].forEach(l => lm.set(l.id, l));
+  out.log = [...lm.values()].sort((x, y) => x.ts < y.ts ? 1 : -1).slice(0, 3000);
+  const sa = a.settings || {}, sb = b.settings || {};
+  out.settings = (sb._t || 0) >= (sa._t || 0) ? {...sa, ...sb} : {...sa};
+  out.deleted = del; return out;
+}
+function delta(full){
+  const since = full ? -1 : SYNC.lastPush, d = {deleted:{}};
+  COLS.forEach(c => d[c] = (S[c] || []).filter(r => full || (r._t || 0) > since));
+  for(const [k, v] of Object.entries(S.deleted || {})) if(full || v > since) d.deleted[k] = v;
+  d.log = S.log.filter(l => full || Date.parse(l.ts) > since);
+  if(full || (S.settings._t || 0) > since){ const {user, ...x} = S.settings; d.settings = x; }
+  return d;
+}
+async function api(method, body, qs = ''){
+  const r = await fetch(SYNC.url + qs, {method, cache:'no-store', headers:{'content-type':'application/json', 'x-shop-pin':lsGet('tcPin') || ''}, body: body ? JSON.stringify(body) : undefined});
+  if(r.status === 401){ const e = new Error('pin'); e.pin = true; throw e; }
+  if(r.status === 404){ const e = new Error('no server'); e.noServer = true; throw e; }
+  if(!r.ok) throw new Error('HTTP ' + r.status);
+  if(!(r.headers.get('content-type') || '').includes('json')){ const e = new Error('no server'); e.noServer = true; throw e; }
+  return r.json();
+}
+function applyRemote(srv){
+  if(!srv || srv.same) return;
+  SYNC.rev = srv.rev || 0;
+  const user = S.settings.user, before = JSON.stringify([S.units, S.products, S.locations, S.orders]);
+  S = mergeState(srv, S); S.settings.user = user; S.rev = SYNC.rev;
+  snapshot(); persist();
+  if(before !== JSON.stringify([S.units, S.products, S.locations, S.orders])) safeRender();
+}
+function safeRender(){
+  const a = document.activeElement;
+  if(a && $('#main').contains(a) && /INPUT|SELECT|TEXTAREA/.test(a.tagName)) return;
+  render();
+}
+function setSync(status){
+  SYNC.status = status; if(status === 'live') SYNC.lastOk = new Date();
+  const el = $('#syncPill'); if(!el) return;
+  el.className = 'sync-pill ' + status;
+  el.textContent = {live:'● Live', offline:'● Offline', local:'', pin:'● PIN needed'}[status] || '';
+  el.title = status === 'live' ? 'Shared live inventory — last synced ' + SYNC.lastOk.toLocaleTimeString() : status === 'offline' ? 'No connection — changes are saved here and will sync when back online' : '';
+  if(view === 'settings' && $('#modalBack').classList.contains('hidden')) safeRender();
+}
+function schedulePush(){ clearTimeout(SYNC.timer); SYNC.timer = setTimeout(push, 350); }
+async function push(){
+  if(!SYNC.on) return; if(SYNC.busy){ SYNC.pending = true; return; }
+  SYNC.busy = true; SYNC.pending = false;
+  const t0 = Date.now(), full = !lsGet('tcLastPush');
+  try{
+    const r = await api('POST', delta(full));
+    SYNC.lastPush = t0 - 1; lsSet('tcLastPush', String(SYNC.lastPush));
+    SYNC.busy = false; applyRemote(r); setSync('live');
+  }catch(e){ SYNC.busy = false; handleSyncError(e); }
+  if(SYNC.pending) schedulePush();
+}
+async function pull(){
+  if(!SYNC.on || SYNC.busy || document.visibilityState === 'hidden') return;
+  try{ const r = await api('GET', null, '?rev=' + SYNC.rev); applyRemote(r); setSync('live');
+    if(lsGet('tcLastPush') && hasUnsent()) push();
+  }catch(e){ handleSyncError(e); }
+}
+function hasUnsent(){ const d = delta(false); return COLS.some(c => d[c].length) || Object.keys(d.deleted).length || d.log.length || d.settings; }
+function handleSyncError(e){
+  if(e.pin){ setSync('pin'); askPin(); return; }
+  if(e.noServer){ SYNC.on = false; setSync('local'); return; }
+  setSync('offline');
+}
+async function initSync(){
+  if(!/^https?:$/.test(location.protocol)) return setSync('local');
+  SYNC.lastPush = +lsGet('tcLastPush') || 0;
+  try{
+    const r = await api('GET');
+    SYNC.on = true;
+    if(r){ applyRemote(r); }
+    if(!r || !lsGet('tcLastPush') || hasUnsent()) await push(); else setSync('live');
+    clearInterval(SYNC.poll); SYNC.poll = setInterval(pull, 8000);
+    if(!lsGet('tcUser')) askName();
+  }catch(e){ handleSyncError(e); }
+}
+window.addEventListener('online', () => { if(SYNC.on) push(); else initSync(); });
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') pull(); });
+function askPin(){
+  if(!$('#modalBack').classList.contains('hidden')) return;
+  modal('Shop PIN', `<div>Enter the shop PIN to open the shared inventory.</div>${field('PIN', `<input id="pinIn" type="password" inputmode="numeric" autocomplete="off">`)}`,
+    [{label:'Work offline'}, {label:'Connect', cls:'pri', fn:() => { lsSet('tcPin', val('pinIn').trim()); setTimeout(initSync, 50); }}]);
+}
+function askName(){
+  if(!$('#modalBack').classList.contains('hidden')) return;
+  modal('Who is using this device?', `<div class="mute">Your name is recorded in History on every allocate, return and scrap.</div>${field('Your name', `<input id="nmIn" value="${esc(S.settings.user || '')}">`)}`,
+    [{label:'Save', cls:'pri', fn:() => { const v = val('nmIn').trim(); if(!v){ toast('Enter a name'); return false; } setUser(v); }}]);
+}
+function setUser(v){ lsSet('tcUser', v); S.settings.user = v; persist(); render(); toast('Hi ' + v); }
+function syncCard(){
+  const st = SYNC.status;
+  const line = st === 'live' ? `<div class="note">● <b>Live</b> — this device shares one inventory with every phone / PC using this link. Last synced ${SYNC.lastOk ? SYNC.lastOk.toLocaleTimeString() : '—'}.</div>`
+    : st === 'offline' ? `<div class="note warn">● <b>Offline</b> — changes are saved on this device and will sync automatically when the connection is back.</div>`
+    : st === 'pin' ? `<div class="note warn">A shop PIN is required. <button class="btn sm" onclick="askPin()">Enter PIN</button></div>`
+    : `<div class="note">This copy is <b>local only</b> (opened as a file, or the site has no sync function). Open it from your Netlify link to share live data.</div>`;
+  return `<div class="card"><div class="hd"><h3>Live sync</h3>${SYNC.on ? `<button class="btn sm" onclick="push();pull()">Sync now</button>` : ''}</div><div class="bd">${line}</div></div>`;
+}
 function commit(msg){ save(); render(); if(msg) toast(msg); }
 
 /* ---------- core mutations ---------- */
@@ -1083,13 +1217,13 @@ function renderSettings(){
     <td class="num">${S.units.filter(u => u.locId === l.id).length}</td><td class="act"><button class="btn sm" onclick="locModal('${l.id}')">Edit</button></td></tr>`).join('');
   return `<div class="grid2">
     <div class="card"><div class="hd"><h3>General</h3></div><div class="bd">
-      ${field('Current user (recorded on every transaction)', `<input value="${esc(S.settings.user)}" onchange="S.settings.user=this.value;commit('User updated')">`)}</div></div>
+      ${field('Your name on this device (recorded in History)', `<input value="${esc(S.settings.user)}" onchange="setUser(this.value.trim())">`)}</div></div>
     <div class="card"><div class="hd"><h3>Data</h3></div><div class="bd row">
       <button class="btn" onclick="exportJSON()">Backup (JSON)</button><button class="btn" onclick="document.getElementById('imp').click()">Restore (JSON)</button>
       <input type="file" id="imp" accept=".json" class="hidden" onchange="importJSON(this)">
       <button class="btn" onclick="exportCSV()">Inventory CSV</button><button class="btn" onclick="importModal()">Paste import</button><button class="btn danger" onclick="resetModal()">Reset…</button></div>
       <div class="bd"><div class="note">Data is saved on this device. Back up to JSON before clearing browser data or moving to another device.</div></div></div></div>
-    ${installCard()}
+    ${syncCard()}${installCard()}
     <div class="card"><div class="hd"><h3>Locations</h3><button class="btn sm" onclick="locModal(null,'cabinet')">+ Cabinet</button><button class="btn sm" onclick="locModal(null,'machine')">+ Machine</button></div>
       <div class="bd flush"><div class="tablewrap"><table><tr><th>Name</th><th>Type</th><th>Bins / model</th><th class="num">Tools</th><th class="act"></th></tr>${lrows}</table></div></div></div>`;
 }
@@ -1376,15 +1510,15 @@ function installCard(){
     : installPrompt ? `<button class="btn pri" onclick="installApp()">Install Trindco Tool Crib</button>`
     : `<div class="mute"><b>iPhone / iPad:</b> open the link in Safari → Share → <b>Add to Home Screen</b>.<br><b>Android:</b> Chrome menu ⋮ → <b>Install app</b>.<br><b>PC:</b> Chrome / Edge → install icon in the address bar.</div>`;
   return `<div class="card installcard"><div class="hd"><h3>App</h3></div><div class="bd">${how}
-    <div class="note" style="margin-top:10px">Each phone / PC keeps its own inventory for now. Move data between devices with Backup → Restore.</div></div></div>`;
+    <div class="note" style="margin-top:10px">${SYNC.on ? 'Inventory is shared live between every device that opens this link.' : 'Open the app from your Netlify link to share one live inventory between devices.'}</div></div></div>`;
 }
 
 /* ---------- import / export ---------- */
 function download(name, text, type){ const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], {type})); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
-const stamp = () => new Date().toISOString().slice(0, 10);
+const dateStamp = () => new Date().toISOString().slice(0, 10);
 const csvCell = v => { v = String(v ?? ''); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
 const toCSV = rows => rows.map(r => r.map(csvCell).join(',')).join('\n');
-function exportJSON(){ download(`trindco-tool-crib-backup-${stamp()}.json`, JSON.stringify(S, null, 2), 'application/json'); }
+function exportJSON(){ download(`trindco-tool-crib-backup-${dateStamp()}.json`, JSON.stringify(S, null, 2), 'application/json'); }
 function importJSON(input){
   const f = input.files[0]; if(!f) return; const r = new FileReader();
   r.onload = () => { try{ const d = JSON.parse(r.result);
@@ -1394,14 +1528,14 @@ function importJSON(input){
   r.readAsText(f);
 }
 function exportCSV(){
-  download(`tool-inventory-${stamp()}.csv`, toCSV([['Serial #','Product','Part #','Batch #','Type','Vendor','Cost','Location','Bin','Condition'],
+  download(`tool-inventory-${dateStamp()}.csv`, toCSV([['Serial #','Product','Part #','Batch #','Type','Vendor','Cost','Location','Bin','Condition'],
     ...sortUnits(S.units).map(u => { const p = prod(u.productId) || {}, l = loc(u.locId) || {}; return [u.serial, p.name, p.partNo, u.batch, p.type, p.vendor, p.cost, l.name, l.kind === 'machine' ? '' : u.slot, u.cond]; })]), 'text/csv');
 }
 function exportLogCSV(){
-  download(`tool-history-${stamp()}.csv`, toCSV([['Time','Action','Serial #','Product','From','To','User','Note'], ...S.log.map(l => [l.ts, l.action, l.serial, l.pname, l.from, l.to, l.user, l.note])]), 'text/csv');
+  download(`tool-history-${dateStamp()}.csv`, toCSV([['Time','Action','Serial #','Product','From','To','User','Note'], ...S.log.map(l => [l.ts, l.action, l.serial, l.pname, l.from, l.to, l.user, l.note])]), 'text/csv');
 }
 function resetModal(){
-  modal('Reset data', `<div class="note warn">Replaces all tools, products, orders and history in this browser. Cabinets and machines are kept. Back up first if you need it.</div>`,
+  modal('Reset data', `<div class="note warn">Replaces all tools, products, orders and history${SYNC.on ? ' <b>for everyone using the live inventory</b>' : ' in this browser'}. Cabinets and machines are kept. Back up first if you need it.</div>`,
     [{label:'Cancel'}, {label:'Reload starter list', fn:() => { S = starterState(S.locations, S.settings.user); commit('Starter list loaded'); }},
      {label:'Start empty', cls:'danger', fn:() => { S = emptyState(S.locations, S.settings.user); commit('Inventory cleared'); }}]);
 }
@@ -1413,7 +1547,7 @@ $('#search').addEventListener('keydown', e => { if(e.key === 'Enter'){ const u =
 $('#search').addEventListener('input', e => { query = e.target.value.trim(); if(!['tools','cabinet','machines','products'].includes(view)) view = 'tools'; render(); });
 $('#modalBack').addEventListener('mousedown', e => { if(e.target.id === 'modalBack') closeModal(); });
 document.addEventListener('keydown', e => { if(e.key === 'Escape'){ if(!$('#scanOv').classList.contains('hidden')) closeScanner(); else closeModal(); } });
-S = load(); save(); render();
+S = load(); if(lsGet('tcUser')) S.settings.user = lsGet('tcUser'); snapshot(); save(); render(); initSync();
 </script>
 </body>
 </html>

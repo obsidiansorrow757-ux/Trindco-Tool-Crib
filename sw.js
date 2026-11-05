@@ -1,5 +1,5 @@
 // Trindco Tool Crib service worker: works offline, picks up new versions when online.
-const CACHE = 'trindco-tool-crib-v1';
+const CACHE = 'trindco-tool-crib-v3';
 const ASSETS = ['./', 'index.html', 'manifest.webmanifest', 'html5-qrcode.min.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png'];
 
@@ -12,7 +12,8 @@ self.addEventListener('activate', e => {
 });
 self.addEventListener('fetch', e => {
   const req = e.request;
-  if(req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  const url = new URL(req.url);
+  if(req.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) return;  // live data always goes to the server
   if(req.mode === 'navigate'){
     // Page: try the network first so updates show up, fall back to the cached copy offline
     e.respondWith(fetch(req).then(res => { const copy = res.clone(); caches.open(CACHE).then(c => c.put('index.html', copy)); return res; })
