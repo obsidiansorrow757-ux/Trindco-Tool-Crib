@@ -1,0 +1,8 @@
+{
+  "name": "trindco-tool-crib",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@netlify/blobs": "^11.1.7"
+  }
+}
